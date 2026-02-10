@@ -4,6 +4,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import logging
 import tempfile
+import traceback
 from PyPDF2 import PdfReader
 from docx import Document
 import csv
@@ -15,13 +16,22 @@ logger = logging.getLogger("MedMentor AI")
 # Load environment
 load_dotenv()
 
-# Initialize OpenAI
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Initialize OpenAI safely
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if OPENAI_API_KEY:
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        logger.error("Failed to initialize OpenAI client: %s", str(e))
+        client = None
+else:
+    logger.error("OPENAI_API_KEY not set; OpenAI requests will use fallback responses.")
+    client = None
 
 # Enhanced user data storage
 USER_DATA = {
-    "Siva": {
-        "name": "Siva",
+    "siva": {
+        "name": "siva",
         "college": "AIIMS Delhi",
         "specialization": "Cardiothoracic Surgery",
         "simulations_completed": 7,
@@ -34,8 +44,8 @@ USER_DATA = {
         "weak_areas": ["artery clamping", "anastomosis techniques"],
         "recent_simulations": ["CABG", "Valve Repair", "Aortic Reconstruction"]
     },
-    "Likhith": {
-        "name": "Likhith",
+    "likhith": {
+        "name": "likhith",
         "college": "CMC Vellore",
         "specialization": "Neurosurgery",
         "simulations_completed": 5,
@@ -61,7 +71,10 @@ def process_uploaded_files(uploaded_files):
             file.file.seek(0)
             raw_bytes = file.file.read()
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=file_name) as tmp:
+            # Use only extension as suffix so readers can detect format
+            _, ext = os.path.splitext(file_name)
+            suffix = ext if ext else None
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                 tmp.write(raw_bytes)
                 tmp_path = tmp.name
             
@@ -82,7 +95,7 @@ def process_uploaded_files(uploaded_files):
             medical_knowledge += f"\n\n[From {file_name}]:\n{text[:5000]}"
             os.unlink(tmp_path)
         except Exception as e:
-            logger.error(f"Error processing {file.filename}: {str(e)}")
+            logger.error("Error processing %s: %s", getattr(file, 'filename', 'upload'), str(e))
     
     return medical_knowledge
 
@@ -144,20 +157,68 @@ Guidelines:
 7. Be concise (3-5 key points)
 """
     
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    # Helper to extract text from various OpenAI response shapes
+    def _extract_text(resp):
+        try:
+            # Newer SDKs may provide output_text
+            if hasattr(resp, "output_text"):
+                return resp.output_text
+            # Legacy shape
+            if isinstance(resp, dict) and resp.get("choices"):
+                ch = resp["choices"][0]
+                if isinstance(ch, dict) and ch.get("message"):
+                    return ch["message"].get("content")
+            # SDK objects
+            if hasattr(resp, "choices"):
+                first = resp.choices[0]
+                if hasattr(first, "message") and hasattr(first.message, "content"):
+                    return first.message.content
+            # Fallback to string
+            return str(resp)
+        except Exception:
+            logger.debug("Failed to extract text from OpenAI response: %s", traceback.format_exc())
+            return ""
+
+    if not client:
+        logger.error("OpenAI client not initialized. user=%s prompt_len=%d", user_data.get('name'), len(message))
+        return "AI assistant temporarily unavailable"
+
     try:
-        response = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message}
-            ],
+        logger.info("OpenAI request start. user=%s model=%s prompt_len=%d", user_data.get('name'), model, len(message))
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message}],
             temperature=0.3,
-            max_tokens=500
+            max_tokens=500,
         )
-        return response.choices[0].message.content
+        logger.info("OpenAI response received for user=%s", user_data.get('name'))
+        text = _extract_text(resp)
+        if not text:
+            logger.warning("OpenAI returned empty text for user=%s", user_data.get('name'))
+            return "AI assistant temporarily unavailable"
+        return text
     except Exception as e:
-        logger.error(f"OpenAI API Error: {str(e)}")
-        return f"⚠️ Error: {str(e)}. Check API key and model availability."
+        logger.error("OpenAI call failed: %s", str(e))
+        logger.debug("%s", traceback.format_exc())
+        # Try a fallback model if model-related error
+        fallback_model = "gpt-3.5-turbo"
+        if model != fallback_model:
+            try:
+                logger.info("Retrying with fallback model=%s for user=%s", fallback_model, user_data.get('name'))
+                resp = client.chat.completions.create(
+                    model=fallback_model,
+                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": message}],
+                    temperature=0.3,
+                    max_tokens=400,
+                )
+                text = _extract_text(resp)
+                if text:
+                    return text
+            except Exception:
+                logger.debug("Fallback model also failed: %s", traceback.format_exc())
+        return "AI assistant temporarily unavailable"
 
 def generate_reply(user_id, prompt, uploaded_files=[]):
     try:
@@ -177,8 +238,13 @@ def generate_reply(user_id, prompt, uploaded_files=[]):
         
         # Handle greetings
         if any(greeting in prompt.lower() for greeting in ["hi", "hello", "hey"]):
-            return (f"👋 Dr. {user_data['name']}! Ready for {user_data['specialization']} training? "
-                    f"Your recent focus: {user_data.get('recent_simulations', ['No recent simulations'])[-1]}")
+            sims = user_data.get("recent_simulations", [])
+            last_sim = sims[-1] if sims else "No recent simulations yet"
+
+            return (
+            f"👋 Dr. {user_data['name']}! Ready for {user_data['specialization']} training? "
+            f"Your recent focus: {last_sim}"
+            )
         
         # Handle performance queries
         if any(word in prompt.lower() for word in ["progress", "stats", "performance", "report"]):
