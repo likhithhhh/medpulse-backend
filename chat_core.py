@@ -203,7 +203,7 @@ Guidelines:
         logger.error("OpenAI call failed: %s", str(e))
         logger.debug("%s", traceback.format_exc())
         # Try a fallback model if model-related error
-        fallback_model = "gpt-3.5-turbo"
+        fallback_model = "gpt-4o-mini"
         if model != fallback_model:
             try:
                 logger.info("Retrying with fallback model=%s for user=%s", fallback_model, user_data.get('name'))
