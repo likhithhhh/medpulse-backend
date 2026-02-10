@@ -16,11 +16,10 @@ app.add_middleware(
 )
 
 @app.post("/chat")
-async def chat(user_id: str = Form(...), prompt: str = Form(...), files: List[UploadFile] = None):
+async def chat(user_id: str = Form(...), prompt: str = Form(...), files: List[UploadFile] = File(None)):
     uploaded = []
     if files:
         for f in files:
-            f.file.seek(0)
             uploaded.append(f)
     reply = generate_reply(user_id, prompt, uploaded)
     return {"reply": reply}

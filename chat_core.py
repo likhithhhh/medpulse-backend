@@ -56,12 +56,10 @@ def process_uploaded_files(uploaded_files):
     
     for file in uploaded_files:
         try:
-            file_name = getattr(file, "filename", None) or getattr(file, "name", "upload")
-            if hasattr(file, "file"):
-                file.file.seek(0)
-                raw_bytes = file.file.read()
-            else:
-                raw_bytes = file.getvalue()
+            file_name = getattr(file, "filename", "upload")
+            # FastAPI UploadFile always has .file attribute
+            file.file.seek(0)
+            raw_bytes = file.file.read()
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=file_name) as tmp:
                 tmp.write(raw_bytes)
@@ -78,30 +76,30 @@ def process_uploaded_files(uploaded_files):
                     reader = csv.reader(f)
                     text = "\n".join([",".join(row) for row in reader])
             else:
-                with open(tmp_path, 'r') as f:
+                with open(tmp_path, 'r', encoding='utf-8', errors='ignore') as f:
                     text = f.read()
             
-            medical_knowledge += f"\n\n[From {file_name}]:\n{text[:5000]}..."  # Truncate long docs
+            medical_knowledge += f"\n\n[From {file_name}]:\n{text[:5000]}"
             os.unlink(tmp_path)
         except Exception as e:
-            logger.error(f"Error processing {getattr(file, 'filename', getattr(file, 'name', 'upload'))}: {str(e)}")
+            logger.error(f"Error processing {file.filename}: {str(e)}")
     
     return medical_knowledge
 
 # Enhanced personalization
 def get_personalized_context(user_data, prompt):
     # Check for specific procedure mentions
-    for procedure in user_data["performance"]:
+    for procedure in user_data.get("performance", {}):
         if procedure.lower() in prompt.lower():
             return f" (Note: Your last {procedure} score was {user_data['performance'][procedure]}⭐)"
     
     # Check for weak area mentions
-    for area in user_data["weak_areas"]:
+    for area in user_data.get("weak_areas", []):
         if area.lower() in prompt.lower():
             return f" (This addresses your weak area in {area})"
     
     # Check for recent simulations
-    for sim in user_data["recent_simulations"]:
+    for sim in user_data.get("recent_simulations", []):
         if sim.lower() in prompt.lower():
             return f" (You recently practiced this in {sim} simulation)"
     
@@ -111,55 +109,55 @@ def get_personalized_context(user_data, prompt):
 def generate_performance_report(user_data):
     # Create performance summary
     perf_summary = "\n".join(
-        [f"- {proc}: {score}⭐" for proc, score in user_data["performance"].items()]
+        [f"- {proc}: {score}⭐" for proc, score in user_data.get("performance", {}).items()]
     )
     
     return (
         f"📊 **{user_data['name']}'s Surgical Training Progress**\n"
         f"🏥 {user_data['college']} | {user_data['specialization']}\n\n"
         f"**Performance Summary**\n{perf_summary}\n\n"
-        f"**Recent Simulations**: {', '.join(user_data['recent_simulations'])}\n"
-        f"**Areas Needing Focus**: {', '.join(user_data['weak_areas'])}\n\n"
+        f"**Recent Simulations**: {', '.join(user_data.get('recent_simulations', []))}\n"
+        f"**Areas Needing Focus**: {', '.join(user_data.get('weak_areas', []))}\n\n"
         f"Need personalized training suggestions?"
     )
 
 # Enhanced medical response with RAG
-def generate_medical_response(message, user_data, history, medical_context):
+def generate_medical_response(message, user_data, medical_context):
     # Get personalized context
     personal_context = get_personalized_context(user_data, message)
     
-    prompt = f"""
-    Role: Senior Professor of {user_data['specialization']} at {user_data['college']}
-    Student: {user_data['name']} ({user_data['simulations_completed']} sims completed)
+    system_prompt = f"""You are a Senior Professor of {user_data['specialization']} at {user_data['college']}.
+You are mentoring {user_data['name']} who has completed {user_data.get('simulations_completed', 0)} simulations.
+
+Weak Areas: {', '.join(user_data.get('weak_areas', []))}
+Recent Simulations: {', '.join(user_data.get('recent_simulations', []))}
+
+{f"Additional Medical Context: {medical_context}" if medical_context else ""}
+
+Guidelines:
+1. Use precise medical terminology
+2. Reference surgical principles
+3. Suggest practical exercises
+4. Highlight pitfalls
+5. Relate to real cases
+6. Address knowledge gaps
+7. Be concise (3-5 key points)
+"""
     
-    Personal Context:{personal_context}
-    Weak Areas: {', '.join(user_data['weak_areas'])}
-    
-    Medical Context:
-    {medical_context}
-    
-    Conversation History:
-    {history[-3:] if history else 'No prior context'}
-    
-    Query: {message}
-    
-    Guidelines:
-    1. Use precise medical terminology
-    2. Reference surgical principles
-    3. Suggest practical exercises
-    4. Highlight pitfalls
-    5. Relate to real cases
-    6. Address knowledge gaps
-    7. Be concise (3-5 key points)
-    """
-    
-    response = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        messages=[{"role": "system", "content": prompt}],
-        temperature=0.3,
-        max_tokens=500
-    )
-    return response.choices[0].message.content
+    try:
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message}
+            ],
+            temperature=0.3,
+            max_tokens=500
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"OpenAI API Error: {str(e)}")
+        return f"⚠️ Error: {str(e)}. Check API key and model availability."
 
 def generate_reply(user_id, prompt, uploaded_files=[]):
     try:
@@ -180,21 +178,21 @@ def generate_reply(user_id, prompt, uploaded_files=[]):
         # Handle greetings
         if any(greeting in prompt.lower() for greeting in ["hi", "hello", "hey"]):
             return (f"👋 Dr. {user_data['name']}! Ready for {user_data['specialization']} training? "
-                    f"Your recent focus: {user_data['recent_simulations'][-1] if user_data['recent_simulations'] else 'No recent simulations'}")
+                    f"Your recent focus: {user_data.get('recent_simulations', ['No recent simulations'])[-1]}")
         
         # Handle performance queries
-        if "progress" in prompt.lower() or "stats" in prompt.lower() or "performance" in prompt.lower():
+        if any(word in prompt.lower() for word in ["progress", "stats", "performance", "report"]):
             return generate_performance_report(user_data)
         
         # Handle simulation requests
-        if "simulation" in prompt.lower() or "practice" in prompt.lower() or "train" in prompt.lower():
+        if any(word in prompt.lower() for word in ["simulation", "practice", "train", "exercise"]):
+            sims = user_data.get('recent_simulations', [])
             return f"🚀 Launching {user_data['specialization']} simulation...\n\n" + \
-                   "\n".join([f"- {sim}" for sim in user_data['recent_simulations']]) + \
-                   "\n\nWhich procedure shall we practice?"
+                   (("\n".join([f"- {sim}" for sim in sims]) + "\n\nWhich procedure shall we practice?") if sims else "Ready to start your training!")
         
         # Default to medical knowledge with RAG
-        return generate_medical_response(prompt, user_data, [], medical_context)
+        return generate_medical_response(prompt, user_data, medical_context)
     
     except Exception as e:
         logger.error(f"Error generating reply: {str(e)}")
-        return "⚠️ Our surgical team is currently in the OR. Please try again later."
+        return f"⚠️ Error: {str(e)}"
